@@ -1,13 +1,17 @@
 (ns me.raynes.fs.compression
   "Compression utilities."
   (:require [clojure.java.io :as io]
+            [clojure.tools.logging :as log]
             [me.raynes.fs :as fs])
   (:import (java.util.zip ZipFile GZIPInputStream)
            (org.apache.commons.compress.archivers.tar TarArchiveInputStream
+                                                      TarArchiveOutputStream
                                                       TarArchiveEntry)
            (org.apache.commons.compress.compressors bzip2.BZip2CompressorInputStream
-                                                    xz.XZCompressorInputStream)
-           (java.io ByteArrayOutputStream)))
+                                                    bzip2.BZip2CompressorOutputStream
+                                                    xz.XZCompressorInputStream
+                                                    xz.XZCompressorOutputStream)
+           (java.io FileOutputStream BufferedOutputStream ByteArrayOutputStream)))
 
 (defn unzip
   "Takes the path to a zipfile `source` and unzips it to target-dir."
@@ -92,6 +96,8 @@
   (io/copy (make-zip-stream-from-files fpaths)
            (fs/file filename)))
 
+;; begin tar
+
 (defn- tar-entries
   "Get a lazy-seq of entries in a tarfile."
   [^TarArchiveInputStream tin]
@@ -103,14 +109,46 @@
   ([source] (untar source (name source)))
   ([source target]
      (with-open [tin (TarArchiveInputStream. (io/input-stream (fs/file source)))]
+       #_(log/debug source "has" (count (tar-entries tin)) "entries")
        (doseq [^TarArchiveEntry entry (tar-entries tin) :when (not (.isDirectory entry))
                :let [output-file (fs/file target (.getName entry))]]
+         (log/debug "Making parent directories for" (.getAbsolutePath output-file))
          (fs/mkdirs (fs/parent output-file))
          (io/copy tin output-file)
+         (log/debug "Copied tin to" (.getAbsolutePath output-file))
          (when (.isFile entry)
            (fs/chmod (apply str (take-last
                                  3 (format "%05o" (.getMode entry))))
                      (.getPath output-file)))))))
+
+(defn- add-tar-entry
+  "Add a single tar entry for the given file."
+  [^TarArchiveOutputStream tar-output-stream ^String fpath]
+  (let [f (io/file fpath)]
+    (log/debug "Add" fpath "with name" (.getName f) "to archive")
+    (.putArchiveEntry tar-output-stream (.createArchiveEntry tar-output-stream f (.getName f)))
+    (io/copy (io/input-stream f) tar-output-stream)
+    (.closeArchiveEntry tar-output-stream)))
+
+(defn- compression-stream [out compression-format]
+  (case compression-format
+    :bz2 (BZip2CompressorOutputStream. out)
+    :xz (XZCompressorOutputStream. out)
+    out))
+
+(defn tar-files
+  "Create tar archive with given base name out of given files, with optional compression format.
+   Returns name of archive, after tar and compression format are appended."
+  [filename-base fpaths & {:keys [compression-format] :or {compression-format :bz2}}]
+  (let [filename (str filename-base ".tar." (name compression-format))]
+    (with-open [file-out (java.io.FileOutputStream. filename)
+                buff-out (BufferedOutputStream. file-out)
+                comp-out (compression-stream buff-out compression-format)
+                tar-out (TarArchiveOutputStream. comp-out)]
+      (run! #(add-tar-entry tar-out %) fpaths))
+    (io/file filename)))
+
+;; end tar
 
 (defn gunzip
   "Takes a path to a gzip file `source` and unzips it."
